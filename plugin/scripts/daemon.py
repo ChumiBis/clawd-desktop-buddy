@@ -9,6 +9,11 @@ Replaces the POSIX FIFO (/tmp/clawd-mood.fifo) used in 0.1.x with a TCP
 localhost socket. The actual listening port is written to a portfile at
 <tempdir>/clawd-mood.port so the hook can discover it. Cross-platform:
 macOS / Linux / Windows.
+
+Aggregates multiple CLI sessions (keyed by session_id) into one summary
+{state, count} per push. Survives USB hot-unplug: a serial error no longer
+kills the daemon — it keeps the TCP server and session state alive, then
+auto-reconnects and re-pushes the current state when the cable is replugged.
 """
 
 import atexit
@@ -57,7 +62,7 @@ def summarize(sessions: dict) -> tuple[str, int]:
     return (summary, count)
 
 
-def detect_port() -> str:
+def find_port() -> str | None:
     override = os.environ.get("CLAWD_MOOD_PORT")
     if override:
         return override
@@ -77,16 +82,21 @@ def detect_port() -> str:
             candidates.append(p.device)
     candidates.sort()
     if not candidates:
-        sys.exit(
-            "No ESP32-like USB CDC device found. Plug it in or set "
-            "CLAWD_MOOD_PORT (mac: /dev/cu.xxx, linux: /dev/ttyACM0, windows: COM3)."
-        )
+        return None
     if len(candidates) > 1:
         print(
             f"  warning: multiple devices found {candidates}, using {candidates[0]}",
             file=sys.stderr,
         )
     return candidates[0]
+
+
+def port_present(path: str) -> bool:
+    """Best-effort check that the serial device is still enumerated, so an
+    unplug can be detected even when no state change triggers a write."""
+    if any(p.device == path for p in list_ports.comports()):
+        return True
+    return os.path.exists(path)  # mac/linux device nodes vanish on unplug
 
 
 def open_serial(port: str) -> serial.Serial:
@@ -148,8 +158,13 @@ def main() -> None:
     PORTFILE.write_text(str(actual_port))
     atexit.register(lambda: PORTFILE.unlink(missing_ok=True))
 
-    serial_port = detect_port()
-    ser = open_serial(serial_port)
+    serial_port = find_port()
+    if serial_port is None:
+        sys.exit(
+            "No ESP32-like USB CDC device found. Plug it in or set "
+            "CLAWD_MOOD_PORT (mac: /dev/cu.xxx, linux: /dev/ttyACM0, windows: COM3)."
+        )
+    ser: serial.Serial | None = open_serial(serial_port)
     print("clawd-mood daemon started")
     print(f"  TCP:    127.0.0.1:{actual_port}")
     print(f"  Portfile: {PORTFILE}")
@@ -159,8 +174,38 @@ def main() -> None:
     sessions: dict[str, tuple[str, float]] = {}
     last_sent: tuple[str, int] | None = None
 
+    def drop_serial(reason: str) -> None:
+        """Mark the serial link as down without killing the daemon, so the TCP
+        server and session state survive an unplug."""
+        nonlocal ser
+        if ser is None:
+            return
+        print(f"  !! serial {reason}: {ser.port}", file=sys.stderr)
+        try:
+            ser.close()
+        except Exception:
+            pass
+        ser = None
+
+    def reconnect_serial() -> None:
+        """Re-open the port after an unplug. On success, force a re-push so the
+        freshly rebooted ESP32 (which powers up at idle) shows current state."""
+        nonlocal ser, last_sent
+        path = find_port()
+        if path is None:
+            return
+        try:
+            ser = open_serial(path)
+        except (serial.SerialException, OSError):
+            ser = None
+            return
+        print(f"  serial reconnected: {path}")
+        last_sent = None  # device rebooted to idle → resend the current state
+
     def push() -> None:
-        nonlocal last_sent
+        nonlocal last_sent, ser
+        if ser is None:
+            return  # serial down; the summary is re-pushed after reconnect
         summary, count = summarize(sessions)
         cur = (summary, count)
         if cur == last_sent:
@@ -171,16 +216,20 @@ def main() -> None:
             ser.flush()
             print(f"  -> {line}  (sessions={len(sessions)})")
             last_sent = cur
-        except serial.SerialException as e:
-            print(f"  !! serial error: {e}", file=sys.stderr)
-            sys.exit(1)
+        except (serial.SerialException, OSError) as e:
+            drop_serial(f"lost ({e})")  # keep running; reconnect on next tick
 
     server.settimeout(PRUNE_INTERVAL)
     while True:
         try:
             conn, _ = server.accept()
         except socket.timeout:
-            # periodic tick: reap crashed sessions, repush if the summary changed
+            # periodic tick: detect unplug, attempt reconnect, reap crashed
+            # sessions, and repush if the summary (or the link) changed.
+            if ser is not None and not port_present(ser.port):
+                drop_serial("unplugged")
+            if ser is None:
+                reconnect_serial()
             prune_sessions(sessions, time.monotonic())
             push()
             continue

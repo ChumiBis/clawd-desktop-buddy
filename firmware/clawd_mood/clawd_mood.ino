@@ -25,7 +25,7 @@
 #define EYE_OY  40
 
 // Colors
-uint16_t C_ORANGE, C_GREEN, C_RED, C_DARKBG, C_MUTED;
+uint16_t C_GREEN, C_YELLOW, C_BUSY, C_DARKBG, C_MUTED;
 #define C_WHITE ST77XX_WHITE
 #define C_BLACK ST77XX_BLACK
 
@@ -54,8 +54,8 @@ inline void present() { tft.drawRGBBitmap(0, 0, canvas.getBuffer(), DISP_W, DISP
 
 void initColors() {
   C_GREEN  = tft.color565(0, 150, 70);     // 0 running — idle / free
-  C_ORANGE = tft.color565(218, 17, 0);     // 1 running — original device orange (red-orange)
-  C_RED    = tft.color565(255, 0, 0);      // >=2 running — busy (pure bright red)
+  C_YELLOW = tft.color565(255, 200, 0);    // 1 running — yellow
+  C_BUSY   = tft.color565(218, 17, 0);     // >=2 running — original device orange (#DA1100)
   C_DARKBG = tft.color565(10, 12, 16);     // blink "off" / dim
   C_MUTED  = tft.color565(90, 88, 86);
   bgColor  = C_GREEN;                       // boot: nothing running
@@ -64,10 +64,18 @@ void initColors() {
 // Map the daemon's color name to RGB565. Unknown/absent -> keep current.
 uint16_t colorToRGB(const char* name) {
   if (!name) return bgColor;
-  if (!strcmp(name, "green"))  return C_GREEN;
-  if (!strcmp(name, "orange")) return C_ORANGE;
-  if (!strcmp(name, "red"))    return C_RED;
+  if (!strcmp(name, "green"))  return C_GREEN;   // load token -> RGB; tokens stay green/orange/red
+  if (!strcmp(name, "orange")) return C_YELLOW;  // 1 running  -> yellow
+  if (!strcmp(name, "red"))    return C_BUSY;    // >=2 running -> device orange
   return bgColor;
+}
+
+// Linear-interpolate two RGB565 colors (k: 0 -> a, 1 -> b). GFX has no alpha,
+// so the sleeping "zzz" fades by lerping its color toward the background.
+uint16_t lerp565(uint16_t a, uint16_t b, float k) {
+  uint8_t ar = ((a >> 11) & 0x1F) << 3, ag = ((a >> 5) & 0x3F) << 2, ab = (a & 0x1F) << 3;
+  uint8_t br = ((b >> 11) & 0x1F) << 3, bg = ((b >> 5) & 0x3F) << 2, bb = (b & 0x1F) << 3;
+  return tft.color565(ar + (br - ar) * k, ag + (bg - ag) * k, ab + (bb - ab) * k);
 }
 
 // Background to fill this frame. When blinkBg (a session is waiting), the load
@@ -216,21 +224,34 @@ void pollSerial() {
 // Each renderer is called every frame (~33fps). They use a static
 // frame counter for animation. They redraw only when needed.
 
-// Bottom-center running-count badge (text size 3): "<count>" followed by 1-3
-// animated dots that rotate (e.g. "1." / "1.." / "1..." , "2.." ...). Shown
-// whenever >=1 session is running. Composed into the canvas before present().
-void drawBottomBadge(int16_t y) {
-  if (workingCount < 1) return;
-  int dots = (int)((millis() / 600) % 3) + 1;   // 1 → 2 → 3 → 1, ~600ms/step
-  char buf[12];
-  int n = snprintf(buf, sizeof(buf), "%d", workingCount);
-  for (int i = 0; i < dots && n < (int)sizeof(buf) - 1; i++) buf[n++] = '.';
-  buf[n] = '\0';
-  int16_t w = (int16_t)strlen(buf) * 6 * 3;   // 6px advance × textsize 3
-  canvas.setTextColor(C_BLACK);
-  canvas.setTextSize(3);
-  canvas.setCursor((DISP_W - w) / 2, y);
-  canvas.print(buf);
+// ── Bottom running-count: one icon per concurrent session ────────
+// The count is drawn as N identical icons (not a digit), so it never collides
+// with any "busy" animation: 1 session = 1 icon, 3 = 3 icons. Past 6 (rare) we
+// fall back to one icon + a number to stay countable.
+//
+// Icon = a vertical bar (equalizer / load-meter style), gently pulsing. To
+// switch the motif, replace drawIcon's body — e.g. a fillCircle for a dot.
+void drawIcon(int16_t x, int16_t cy, int i) {
+  int16_t h = 20 + (int16_t)(sinf(millis() / 280.0f + i * 1.2f) * 4);  // ~16-24px pulse
+  canvas.fillRoundRect(x - 5, cy + 12 - h, 10, h, 3, C_BLACK);         // bottoms aligned
+}
+
+void drawCountIcons(int16_t cy) {
+  int n = workingCount;
+  if (n < 1) return;
+  if (n <= 6) {
+    int16_t gap = (n <= 4) ? 30 : 26;             // tighten spacing past 4 so it stays centered
+    int16_t x0 = 120 - (n - 1) * gap / 2;
+    for (int i = 0; i < n; i++) drawIcon(x0 + i * gap, cy, i);
+  } else {
+    drawIcon(104, cy, 0);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", n);
+    canvas.setTextColor(C_BLACK);
+    canvas.setTextSize(3);
+    canvas.setCursor(122, cy - 10);
+    canvas.print(buf);
+  }
 }
 
 void drawIdle() {
@@ -291,7 +312,7 @@ void drawThinking() {
     }
     canvas.fillRect(lx + dx, ey + dy, EYE_W, EYE_H, C_BLACK);
     canvas.fillRect(rx + dx, ey + dy, EYE_W, EYE_H, C_BLACK);
-    drawBottomBadge(180);  // (legacy: daemon no longer sends "thinking")
+    drawCountIcons(196);  // (legacy: daemon no longer sends "thinking")
     present();
     phase++;
     lastStep = now;
@@ -299,17 +320,34 @@ void drawThinking() {
   }
 }
 
+// Spinning spiral ("dizzy") eye, drawn as overlapping dots along an
+// Archimedean spiral. Used when >=2 sessions run (overloaded = tired).
+void drawSpiralEye(int16_t cx, int16_t cy, float rot) {
+  for (float a = 0; a < PI * 3.6f; a += 0.13f) {
+    float r = 2 + a * 2.3f;
+    canvas.fillCircle(cx + (int16_t)(cosf(a + rot) * r),
+                      cy + (int16_t)(sinf(a + rot) * r), 2, C_BLACK);
+  }
+}
+
 void drawWorking() {
   static unsigned long lastStep = 0;
   unsigned long now = millis();
-  if (moodDirty || now - lastStep > 300) {
+  bool dizzy = workingCount >= 2;            // 1 task = focused; 2+ = dizzy/tired
+  unsigned long interval = dizzy ? 60 : 300; // spiral spins smoothly; jitter is slow
+  if (moodDirty || now - lastStep > interval) {
     canvas.fillScreen(bgColor);
-    int16_t lx = eyeLX(0), rx = eyeRX(0), ey = eyeY();
-    // Slight focused twitch: 2px random jitter on each eye
-    int16_t jx = (now / 100) % 3 - 1;  // -1, 0, 1
-    canvas.fillRect(lx + jx, ey, EYE_W, EYE_H, C_BLACK);
-    canvas.fillRect(rx - jx, ey, EYE_W, EYE_H, C_BLACK);
-    drawBottomBadge(180);   // "<count>" + rotating dots (count>=1 while working)
+    if (dizzy) {
+      float rot = now / 600.0f;
+      drawSpiralEye(eyeLX(0) + EYE_W / 2, eyeCY(), rot);
+      drawSpiralEye(eyeRX(0) + EYE_W / 2, eyeCY(), rot + 0.6f);
+    } else {
+      int16_t lx = eyeLX(0), rx = eyeRX(0), ey = eyeY();
+      int16_t jx = (now / 100) % 3 - 1;      // -1, 0, 1 focused twitch
+      canvas.fillRect(lx + jx, ey, EYE_W, EYE_H, C_BLACK);
+      canvas.fillRect(rx - jx, ey, EYE_W, EYE_H, C_BLACK);
+    }
+    drawCountIcons(196);
     present();
     lastStep = now;
     moodDirty = false;
@@ -328,7 +366,7 @@ void drawWaiting() {
     int16_t eh = EYE_H + 6;
     canvas.fillRect(lx, ey + bounce - 3, EYE_W, eh, C_BLACK);
     canvas.fillRect(rx, ey + bounce - 3, EYE_W, eh, C_BLACK);
-    drawBottomBadge(180);   // running count + dots (waiting is counted; no more "?")
+    drawCountIcons(196);   // running count icons (waiting is counted; no more "?")
     present();
     step++;
     lastStep = now;
@@ -371,7 +409,7 @@ void drawError() {
     int16_t jy = ((now / 80) * 31) % 5 - 2;
     canvas.fillRect(lx + jx, ey + 6 + jy, EYE_W, EYE_H - 6, C_BLACK);
     canvas.fillRect(rx - jx, ey - 6 + jy, EYE_W, EYE_H - 6, C_BLACK);
-    drawBottomBadge(180);   // error is counted as running → show the count
+    drawCountIcons(196);   // error is counted as running → show the count
     present();
     lastStep = now;
     moodDirty = false;
@@ -380,23 +418,28 @@ void drawError() {
 
 void drawSleeping() {
   static unsigned long lastStep = 0;
-  static uint8_t zPhase = 0;
   unsigned long now = millis();
-  if (moodDirty || now - lastStep > 500) {
+  if (moodDirty || now - lastStep > 90) {       // ~11fps: slow, smooth rise
     canvas.fillScreen(bgColor);
     int16_t lx = eyeLX(0), rx = eyeRX(0), cy = eyeCY();
-    // Closed eyes: thin horizontal bars
-    canvas.fillRect(lx, cy - 2, EYE_W, 4, C_BLACK);
-    canvas.fillRect(rx, cy - 2, EYE_W, 4, C_BLACK);
-    // Floating Z: 3 positions, rising
-    canvas.setTextColor(C_BLACK);
-    canvas.setTextSize(2);
-    int16_t zy[] = {170, 150, 130};
-    int16_t zx[] = {140, 150, 160};
-    canvas.setCursor(zx[zPhase % 3], zy[zPhase % 3]);
-    canvas.print("Z");
+    // Closed eyes with a gentle breathing bob
+    int16_t br = (int16_t)(sinf(now / 700.0f) * 1.5f);
+    canvas.fillRect(lx, cy - 2 + br, EYE_W, 4, C_BLACK);
+    canvas.fillRect(rx, cy - 2 + br, EYE_W, 4, C_BLACK);
+    // Three z's rising from the bottom-center, fading into the bg near the top
+    const unsigned long T = 2400;
+    for (int i = 0; i < 3; i++) {
+      float p = ((now + i * (T / 3)) % T) / (float)T;     // 0 -> 1 lifetime
+      uint8_t sz = (p < 0.45f) ? 2 : 3;                   // small z then big Z
+      int16_t x = 120 - 3 * sz + (int16_t)(sinf(p * PI) * 8);
+      int16_t y = 205 - (int16_t)(p * 60);
+      float k = (p < 0.7f) ? 0.0f : (p - 0.7f) / 0.3f;    // fade to bg in last 30%
+      canvas.setTextColor(lerp565(C_BLACK, bgColor, k));
+      canvas.setTextSize(sz);
+      canvas.setCursor(x, y);
+      canvas.print((p < 0.45f) ? "z" : "Z");
+    }
     present();
-    zPhase++;
     lastStep = now;
     moodDirty = false;
   }

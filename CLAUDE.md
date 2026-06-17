@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概要
 
-`clawd-mood` 是一个 ESP32-C3 + ST7789 1.54" TFT 桌面摆件，通过 USB 串口接收 **Claude Code / OpenAI Codex CLI** 的运行状态，实时切换 7 种像素眼睛表情（idle / thinking / working / waiting / done / error / sleeping）。
+`clawd-mood` 是一个 ESP32-C3 + ST7789 1.54" TFT 桌面摆件，通过 USB 串口接收 **Claude Code / OpenAI Codex CLI** 的运行状态，实时切换像素眼睛表情（`idle / working / waiting / done / error`，外加固件本地的 `sleeping`；**无 thinking**，已并入 working）+ 负载背景色 + 并发计数。
 
 **跨平台桌面摆件（macOS / Linux / Windows）**。明确不做：WiFi 控制、OTA、launchd/systemd 系统级自启、自动化单元测试、蜂鸣器、多设备。Windows 端代码完成但 **untested on Windows** —— 欢迎社区验证（见 README）。Linux 同样未在 CI 验证，但 POSIX 路径与 macOS 共用，回归风险低。
 
@@ -81,23 +81,29 @@ hook 端不直接读 `48756`，而是读 portfile 拿实际端口。这样：
 
 ## 状态机设计原则
 
-7 个状态由 hook → daemon → 固件单向推送。**有两个转移在固件本地完成**，不靠上游：
+**5 个会话状态**：`idle | working | waiting | done | error`（小写严格匹配，固件 `parseMood` 用 `strcmp` 大小写敏感）。**没有 thinking**——并入 `working`（daemon 把收到的 `thinking` 归一化成 `working`）。`sleeping` 是固件本地态，daemon 从不下发。
 
-- `Done` 进入后 3 秒（`DONE_REVERT_MS`）自动回 `Idle` —— done 是瞬态，否则会卡在笑脸
-- 任何状态在 5 分钟（`SLEEP_IDLE_MS`）没有串口消息时进入 `Sleeping`
-- 任何串口消息立即唤醒 `Sleeping`
+**固件本地两个转移**（不靠上游）：
+- `done` 进入后 3 秒（`DONE_REVERT_MS`）自动回 `idle`（done 是瞬态）
+- 任何状态 5 分钟（`SLEEP_IDLE_MS`）无串口消息进 `sleeping`，任何消息立即唤醒
 
-hook 端的事件→状态映射是**多对一收敛**：`PreToolUse` / `PostToolUse` / `SubagentStart` / `SubagentStop` 都映射到 `working`，避免表情在工具调用过程中乱跳。改 `hook.py` 的 `EVENT_TO_STATE` 表时保持这个收敛行为。
+**事件→状态收敛**：`PreToolUse`/`PostToolUse` → working；`UserPromptSubmit` → working（原 thinking）；`PostToolUseFailure` → error（CC 独有）；`Stop` → done；`PreCompact` → working、`PostCompact` → idle（两端注册；手动 `/compact` 后还有 `SessionStart(compact)`→idle）；`PermissionRequest` → waiting（Codex 独有，对标 CC 的 `Notification`）。
 
-**Codex CLI 独有事件映射**（codex 0.133.0 起）：
+**`SubagentStart`/`SubagentStop` 故意不映射（忽略）**：真 subagent 用 `Task` 工具起，其 `Pre`/`PostToolUse` 已表达 working；而 **recap/away_summary**（用户离开时自动生成的摘要）是**内部 subagent**，完成发 `SubagentStop` 但前面**无 Task PreToolUse**——若映射成 working 会把**空闲会话**翻成 working 且无后续 Stop 而卡死（实测真凶）。忽略它从根上修掉，顺带覆盖 ai-title 等内部 subagent。**改 `EVENT_TO_STATE` 时别把 Subagent\* 加回去。**
 
-- `PermissionRequest` → `waiting`（codex 等用户批准命令，对标 Claude Code 的 `Notification`）
-- `PreCompact` → `thinking`（codex 正在压缩上下文）
-- `PostCompact` → `working`（codex 压缩完成回到工作流）
+**`Notification`（仅 CC）按 `notification_type` 分类**：`permission_prompt` / `elicitation_dialog` → `waiting`（等我确认）；`idle_prompt`（闲置 ~60s）→ `idle`（兼作打断后自愈）；其余忽略。无 `notification_type` 时按 message 文本兜底（见 `classify_notification`）。
 
-Claude Code 独有事件 `PostToolUseFailure` / `Notification` 仍保留映射，Codex 不会触发，互不干扰。
+**打断（Esc）无 hook**：按 Esc 不触发任何 hook，被打断会话卡在 `working`；靠 `idle_prompt`（~60s，仅 CC）/ TTL（600s）自愈，无法即时归零（平台限制）。
 
-state 枚举（小写、严格匹配）：`idle | thinking | working | waiting | done | error | sleeping`。固件里 `parseMood` 用 `strcmp`，**大小写敏感**。
+⚠️ **Codex 没有** `Notification` / `PostToolUseFailure` / `SessionEnd`：idle 自愈弱、关窗不立即移除（等 TTL）。
+
+**多会话聚合**（daemon 按 `session_id` 维护每会话最新态，聚合成 `{state,count,color,blink,bottom}` 推串口）：
+- `count` = 同时 `{working, error, waiting}` 的会话数。`waiting` **计入**（等确认是真任务）；`error` 计入（避免工具失败抖动）；不计 idle/done。固件 `count>=1` 显示「数字+滚动点」（`1.`/`1..`/`1...`、`2..`，点 1/2/3 每 ~600ms 轮换）。
+- 脸 = 最高优先级：`waiting > error > working > done > idle`。
+- 显示策略（`daemon.display` 纯函数，可测、改阈值不重烧）：`color` 0绿/1橙/≥2红；`blink` 仅 `waiting`（背景按负载色闪，无 `?`）；`bottom` count 字符串。固件配色 `green(0,150,70)` / `orange(218,17,0)` / `red(255,0,0)`。
+- 清理：`SessionEnd` 立即移除；idle_prompt(60s，CC)；TTL 600s 兜底；**陈旧降级**（`working`/`error` 静默超 `CLAWD_MOOD_STALE_SEC` 秒当 idle、收到事件即恢复、`waiting` 豁免）**默认关**——会误降长静默真任务，且 recap 根因已修、平时不需要。
+- 排障：状态快照 `<tempdir>/clawd-mood-status.log`（逐会话 + 聚合，`./plugin/scripts/watch.sh` 1 秒刷新）+ 逐事件日志 `<tempdir>/clawd-mood-events.log`。
+- 完整规格见 `docs/superpowers/specs/2026-06-17-multi-session-state-machine-design.md`，纯逻辑单测 `plugin/scripts/test_state_machine.py`（230 用例，`uv run` 直接跑）。
 
 ## 双 CLI 并发
 
@@ -106,7 +112,7 @@ state 枚举（小写、严格匹配）：`idle | thinking | working | waiting |
 - TCP server 接受多客户端：两个 CLI 的 hook 进程各自短连接写 `127.0.0.1:<port>`，daemon `accept()` 循环串行消费
 - daemon singleton 不变：`SessionStart` 拉 daemon 时 hook 走 `probe_daemon()`（portfile + 试连）防重复
 - 串口由 daemon 独占：两个 CLI 共享同一个 daemon → 共享同一个串口
-- 表情序列按事件到达顺序交错驱动，**不做合并/去重**——这意味着两端长任务同时跑时表情会快速切换，是预期行为
+- daemon 按 `session_id` 聚合：维护每会话最新状态，按优先级选一张脸 + `{working,error,waiting}` 计数（见上「多会话聚合」与 spec）。多端长任务并发时脸仍会随事件到达切换，是预期行为
 
 如果觉得"鬼畜"，停掉其中一端的会话即可（不需要卸载插件）。
 
@@ -176,7 +182,7 @@ PYTHONUNBUFFERED=1 ./plugin/scripts/daemon.py
 claude --plugin-dir /absolute/path/to/clawd-mood/plugin
 ```
 
-在 Claude Code 里 `/hooks` 确认 9 个事件都挂上（SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PostToolUseFailure / Notification / Stop / SubagentStart / SubagentStop）。
+在 Claude Code 里 `/hooks` 确认 12 个事件都挂上（SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PostToolUseFailure / Notification / Stop / SubagentStart / SubagentStop / PreCompact / PostCompact / SessionEnd）。
 
 **Codex CLI**（≥ 0.133.0）：
 
@@ -220,11 +226,12 @@ JSON 校验：`python3 -m json.tool plugin/hooks/hooks.json`
 
 ## 测试策略
 
-**没有自动化测试**——硬件依赖重、IO 逻辑短，靠手测 + 集成测覆盖：
+**状态机逻辑有单测，硬件/IO 靠手测**：
 
-- **固件单独**：Arduino 串口监视器手输 7 种 JSON，肉眼确认 7 表情
+- **状态机纯逻辑**：`uv run plugin/scripts/test_state_machine.py`（230 用例，无硬件依赖，覆盖事件/通知分类、聚合、优先级、`display`、各场景、陈旧降级、随机 oracle）。requirement-driven：按需求写测试 → 实现 → 独立验证。
+- **固件单独**：Arduino 串口监视器手输各状态 JSON，肉眼确认表情（`idle/working/waiting/done/error`）
 - **daemon + 固件**：`printf '{"state":"working"}\n' | nc 127.0.0.1 $(cat /tmp/clawd-mood.port)`（mac/linux），Windows PowerShell 见上"手动测试"段
-- **端到端**：跑真实任务（"列出当前目录"），观察 Idle → Thinking → Working → Done → Idle 序列
+- **端到端**：跑真实任务，观察 idle → working → done → idle；多开会话核对计数/颜色；用 `./plugin/scripts/watch.sh` 看逐会话快照
 - **Done 3 秒回 Idle、Sleeping 5 分钟进入**：临时把 `SLEEP_IDLE_MS` 改成 `15000UL` 缩短验证
 - **Linux / Windows**：未在本地端到端验证；代码层 review 确认无 macOS-isms。社区验证 welcome
 
@@ -235,15 +242,18 @@ JSON 校验：`python3 -m json.tool plugin/hooks/hooks.json`
 - `firmware/clawd_mood/clawd_mood.ino` —— 单文件 Arduino sketch；7 个 `drawXxx()` 函数 + `tickMoodMachine()` 计时器 + `pollSerial()` 拼行 + `handleLine()` JSON 解析
 - `plugin/.claude-plugin/plugin.json` —— Claude Code 插件清单
 - `plugin/.codex-plugin/plugin.json` —— Codex CLI 插件清单（指向 `hooks-codex.json`）
-- `plugin/hooks/hooks.json` —— Claude Code 9 个事件全 `async: true`，命令统一指 `uv run "$CLAUDE_PLUGIN_ROOT"/scripts/hook.py`
+- `plugin/hooks/hooks.json` —— Claude Code 12 个事件（含 `PreCompact` / `PostCompact` / `SessionEnd`）全 `async: true`，命令统一指 `uv run "$CLAUDE_PLUGIN_ROOT"/scripts/hook.py`
 - `plugin/hooks/hooks-codex.json` —— Codex 10 个事件（含 PermissionRequest / PreCompact / PostCompact），同一个 hook.py
-- `plugin/scripts/hook.py` —— event → state 映射，TCP 短连接写 daemon（PEP 723，标准库 only，共享给两端）
-- `plugin/scripts/daemon.py` —— PEP 723 内联依赖，TCP server ↔ 串口桥；portfile 服务发现
+- `plugin/scripts/hook.py` —— event → state 映射 + `Notification` 分类 + `session_id`/`cwd` 透传（Subagent\* 不映射）；TCP 短连接写 daemon（PEP 723，标准库 only，共享给两端）
+- `plugin/scripts/daemon.py` —— PEP 723 内联依赖，TCP server ↔ 串口桥；portfile 服务发现；多会话聚合 + `display` 显示策略 + 陈旧降级（默认关）+ 串口热插拔 + 状态快照/逐事件日志
+- `plugin/scripts/test_state_machine.py` —— 状态机纯逻辑单测（230 用例：hook 分类 + daemon 聚合/display/陈旧降级，`uv run` 直接跑，无硬件依赖）
+- `plugin/scripts/watch.sh` —— 1 秒刷新看 daemon 状态快照（聚合 + 逐会话明细），排障用
 - `.agents/plugins/marketplace.json` —— Codex 本地 marketplace 入口
 - `AGENTS.md` —— Codex 项目守则，指回本文件
 - `docs/superpowers/specs/2026-06-07-clawd-mood-design.md` —— 原始设计说明书（**改架构前先读这个**）
 - `docs/superpowers/specs/2026-06-07-codex-support-design.md` —— Codex 支持设计说明书
 - `docs/superpowers/specs/2026-06-08-windows-linux-support-design.md` —— Windows + Linux 跨平台设计说明书
+- `docs/superpowers/specs/2026-06-17-multi-session-state-machine-design.md` —— 多会话状态机规格（聚合/计数/`?` 语义/优先级，**改聚合规则前先读**）
 - `docs/superpowers/plans/2026-06-07-clawd-mood-implementation.md` —— 原始 18 任务实施计划
 - `docs/superpowers/plans/2026-06-07-codex-support-implementation.md` —— Codex 支持 8 任务实施计划
 - `docs/superpowers/plans/2026-06-08-windows-linux-support-implementation.md` —— 跨平台实施计划

@@ -25,11 +25,12 @@
 #define EYE_OY  40
 
 // Colors
-uint16_t C_ORANGE, C_DARKBG, C_MUTED;
+uint16_t C_ORANGE, C_GREEN, C_RED, C_DARKBG, C_MUTED;
 #define C_WHITE ST77XX_WHITE
 #define C_BLACK ST77XX_BLACK
 
-uint16_t bgColor = 0;  // initialized in initColors()
+uint16_t bgColor = 0;   // current load color (green/orange/red), set from daemon "color"
+bool blinkBg = false;   // true while a session is waiting for my confirmation
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
@@ -43,7 +44,7 @@ unsigned long lastEventMs = 0;
 unsigned long doneEnteredMs = 0;
 bool moodDirty = true;
 String serialBuf;
-int workingCount = 0;   // concurrent working+waiting sessions (from daemon "count" field)
+int workingCount = 0;   // concurrent running sessions = working+error+waiting (from daemon "count")
 
 // Off-screen framebuffer (double buffering): every frame is composed here, then
 // pushed to the panel in a single drawRGBBitmap blit. The on-glass pixels are
@@ -52,10 +53,28 @@ GFXcanvas16 canvas(DISP_W, DISP_H);
 inline void present() { tft.drawRGBBitmap(0, 0, canvas.getBuffer(), DISP_W, DISP_H); }
 
 void initColors() {
-  C_ORANGE = tft.color565(218, 17, 0);
-  C_DARKBG = tft.color565(10, 12, 16);
+  C_GREEN  = tft.color565(0, 150, 70);     // 0 running — idle / free
+  C_ORANGE = tft.color565(218, 17, 0);     // 1 running — original device orange (red-orange)
+  C_RED    = tft.color565(255, 0, 0);      // >=2 running — busy (pure bright red)
+  C_DARKBG = tft.color565(10, 12, 16);     // blink "off" / dim
   C_MUTED  = tft.color565(90, 88, 86);
-  bgColor  = C_ORANGE;
+  bgColor  = C_GREEN;                       // boot: nothing running
+}
+
+// Map the daemon's color name to RGB565. Unknown/absent -> keep current.
+uint16_t colorToRGB(const char* name) {
+  if (!name) return bgColor;
+  if (!strcmp(name, "green"))  return C_GREEN;
+  if (!strcmp(name, "orange")) return C_ORANGE;
+  if (!strcmp(name, "red"))    return C_RED;
+  return bgColor;
+}
+
+// Background to fill this frame. When blinkBg (a session is waiting), the load
+// color alternates with a dim color on a ~1.2s cycle (600ms on / 600ms off).
+uint16_t activeBg() {
+  if (!blinkBg) return bgColor;
+  return ((millis() / 600) % 2 == 0) ? bgColor : C_DARKBG;
 }
 
 inline int16_t eyeLX(int16_t ox) {
@@ -172,6 +191,10 @@ void handleLine(const String& line) {
     workingCount = newCount;
     moodDirty = true;   // count changed → force a redraw even if mood is unchanged
   }
+  uint16_t newBg = colorToRGB(doc["color"] | "");
+  if (newBg != bgColor) { bgColor = newBg; moodDirty = true; }
+  bool newBlink = doc["blink"] | false;
+  if (newBlink != blinkBg) { blinkBg = newBlink; moodDirty = true; }
   setMood(next);
   lastEventMs = millis();
 }
@@ -193,11 +216,16 @@ void pollSerial() {
 // Each renderer is called every frame (~33fps). They use a static
 // frame counter for animation. They redraw only when needed.
 
-// Bottom-center session count (text size 3), shown only when ≥2 concurrent
-// working/waiting sessions. Composed into the canvas before present().
-void drawCountBadge(int16_t y) {
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%d", workingCount);
+// Bottom-center running-count badge (text size 3): "<count>" followed by 1-3
+// animated dots that rotate (e.g. "1." / "1.." / "1..." , "2.." ...). Shown
+// whenever >=1 session is running. Composed into the canvas before present().
+void drawBottomBadge(int16_t y) {
+  if (workingCount < 1) return;
+  int dots = (int)((millis() / 600) % 3) + 1;   // 1 → 2 → 3 → 1, ~600ms/step
+  char buf[12];
+  int n = snprintf(buf, sizeof(buf), "%d", workingCount);
+  for (int i = 0; i < dots && n < (int)sizeof(buf) - 1; i++) buf[n++] = '.';
+  buf[n] = '\0';
   int16_t w = (int16_t)strlen(buf) * 6 * 3;   // 6px advance × textsize 3
   canvas.setTextColor(C_BLACK);
   canvas.setTextSize(3);
@@ -263,6 +291,7 @@ void drawThinking() {
     }
     canvas.fillRect(lx + dx, ey + dy, EYE_W, EYE_H, C_BLACK);
     canvas.fillRect(rx + dx, ey + dy, EYE_W, EYE_H, C_BLACK);
+    drawBottomBadge(180);  // (legacy: daemon no longer sends "thinking")
     present();
     phase++;
     lastStep = now;
@@ -271,7 +300,6 @@ void drawThinking() {
 }
 
 void drawWorking() {
-  static uint8_t dots = 0;
   static unsigned long lastStep = 0;
   unsigned long now = millis();
   if (moodDirty || now - lastStep > 300) {
@@ -281,20 +309,8 @@ void drawWorking() {
     int16_t jx = (now / 100) % 3 - 1;  // -1, 0, 1
     canvas.fillRect(lx + jx, ey, EYE_W, EYE_H, C_BLACK);
     canvas.fillRect(rx - jx, ey, EYE_W, EYE_H, C_BLACK);
-    if (workingCount >= 2) {
-      // Multiple concurrent sessions: show the count instead of the dots
-      drawCountBadge(180);
-    } else {
-      // Bottom: . / .. / ... cycle
-      canvas.setTextColor(C_BLACK);
-      canvas.setTextSize(3);
-      canvas.setCursor(95, 180);
-      if      (dots % 3 == 0) canvas.print(".");
-      else if (dots % 3 == 1) canvas.print("..");
-      else                    canvas.print("...");
-    }
+    drawBottomBadge(180);   // "<count>" + rotating dots (count>=1 while working)
     present();
-    dots++;
     lastStep = now;
     moodDirty = false;
   }
@@ -305,27 +321,14 @@ void drawWaiting() {
   static unsigned long lastStep = 0;
   unsigned long now = millis();
   if (moodDirty || now - lastStep > 250) {
-    canvas.fillScreen(bgColor);
+    canvas.fillScreen(activeBg());   // blinks: load color <-> dim
     int16_t lx = eyeLX(0), rx = eyeRX(0), ey = eyeY();
     int16_t bounce = (step % 4 < 2) ? -6 : 6;
     // Slightly bigger eyes for "wide open" look
     int16_t eh = EYE_H + 6;
     canvas.fillRect(lx, ey + bounce - 3, EYE_W, eh, C_BLACK);
     canvas.fillRect(rx, ey + bounce - 3, EYE_W, eh, C_BLACK);
-    canvas.setTextColor(C_BLACK);
-    if (workingCount >= 2) {
-      // "?N" — N concurrent sessions, at least one awaiting input
-      char buf[8];
-      snprintf(buf, sizeof(buf), "?%d", workingCount);
-      int16_t w = (int16_t)strlen(buf) * 6 * 3;
-      canvas.setTextSize(3);
-      canvas.setCursor((DISP_W - w) / 2, 185);
-      canvas.print(buf);
-    } else {
-      canvas.setTextSize(4);
-      canvas.setCursor(105, 185);
-      canvas.print("?");
-    }
+    drawBottomBadge(180);   // running count + dots (waiting is counted; no more "?")
     present();
     step++;
     lastStep = now;
@@ -368,6 +371,7 @@ void drawError() {
     int16_t jy = ((now / 80) * 31) % 5 - 2;
     canvas.fillRect(lx + jx, ey + 6 + jy, EYE_W, EYE_H - 6, C_BLACK);
     canvas.fillRect(rx - jx, ey - 6 + jy, EYE_W, EYE_H - 6, C_BLACK);
+    drawBottomBadge(180);   // error is counted as running → show the count
     present();
     lastStep = now;
     moodDirty = false;

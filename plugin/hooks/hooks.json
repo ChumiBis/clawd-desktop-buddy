@@ -44,6 +44,11 @@
       { "matcher": "", "hooks": [
         { "type": "command", "command": "uv run \"$CLAUDE_PLUGIN_ROOT\"/scripts/hook.py", "async": true }
       ]}
+    ],
+    "SessionEnd": [
+      { "matcher": "", "hooks": [
+        { "type": "command", "command": "uv run \"$CLAUDE_PLUGIN_ROOT\"/scripts/hook.py", "async": true }
+      ]}
     ]
   }
 }

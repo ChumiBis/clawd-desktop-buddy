@@ -90,17 +90,26 @@ def main() -> None:
         return
     event = payload.get("hook_event_name", "")
     tool = payload.get("tool_name", "")
-    state = EVENT_TO_STATE.get(event)
-    if state is None:
-        return
+    session_id = payload.get("session_id", "")
 
     if event == "SessionStart":
         ensure_daemon_running()
 
+    # SessionEnd carries no state — it tells the daemon to drop this session
+    # from the concurrent-session count. All other events map to a state.
+    if event == "SessionEnd":
+        line = json.dumps({"event": event, "session_id": session_id}) + "\n"
+    else:
+        state = EVENT_TO_STATE.get(event)
+        if state is None:
+            return
+        line = json.dumps(
+            {"state": state, "event": event, "tool": tool, "session_id": session_id}
+        ) + "\n"
+
     port = read_portfile()
     if port is None:
         return  # daemon still warming up; next event will catch up
-    line = json.dumps({"state": state, "event": event, "tool": tool}) + "\n"
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=0.3) as s:
             s.sendall(line.encode())

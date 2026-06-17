@@ -28,6 +28,34 @@ BAUD_RATE = 115200
 DEFAULT_TCP_PORT = 48756
 PORTFILE = Path(tempfile.gettempdir()) / "clawd-mood.port"
 
+# Multi-session aggregation. The daemon tracks each CLI session's latest state
+# and pushes a single summary {state, count} to the firmware:
+#   count   = sessions currently working or waiting (shown on screen when >= 2)
+#   state   = the highest-priority live session state (the face to display)
+SESSION_TTL = 600.0            # drop a session with no event for 10 min (crash safety net)
+PRUNE_INTERVAL = 5.0           # how often the accept loop wakes to prune/repush
+COUNTED_STATES = {"working", "waiting"}
+STATE_PRIORITY = {
+    "error": 6, "waiting": 5, "working": 4,
+    "thinking": 3, "done": 2, "idle": 1, "sleeping": 0,
+}
+
+
+def prune_sessions(sessions: dict, now: float) -> None:
+    stale = [sid for sid, (_, ts) in sessions.items() if now - ts > SESSION_TTL]
+    for sid in stale:
+        del sessions[sid]
+
+
+def summarize(sessions: dict) -> tuple[str, int]:
+    """Return (summary_state, counted_session_count)."""
+    if not sessions:
+        return ("idle", 0)
+    states = [st for st, _ in sessions.values()]
+    summary = max(states, key=lambda s: STATE_PRIORITY.get(s, 0))
+    count = sum(1 for s in states if s in COUNTED_STATES)
+    return (summary, count)
+
 
 def detect_port() -> str:
     override = os.environ.get("CLAWD_MOOD_PORT")
@@ -128,26 +156,56 @@ def main() -> None:
     print(f"  Serial: {serial_port}")
     print("  Ready!")
 
+    sessions: dict[str, tuple[str, float]] = {}
+    last_sent: tuple[str, int] | None = None
+
+    def push() -> None:
+        nonlocal last_sent
+        summary, count = summarize(sessions)
+        cur = (summary, count)
+        if cur == last_sent:
+            return  # nothing changed — don't spam the serial line
+        line = json.dumps({"state": summary, "count": count})
+        try:
+            ser.write((line + "\n").encode())
+            ser.flush()
+            print(f"  -> {line}  (sessions={len(sessions)})")
+            last_sent = cur
+        except serial.SerialException as e:
+            print(f"  !! serial error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    server.settimeout(PRUNE_INTERVAL)
     while True:
-        conn, _ = server.accept()
+        try:
+            conn, _ = server.accept()
+        except socket.timeout:
+            # periodic tick: reap crashed sessions, repush if the summary changed
+            prune_sessions(sessions, time.monotonic())
+            push()
+            continue
         with conn:
             data = conn.recv(4096)
-            for line in data.decode("utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    json.loads(line)
-                except json.JSONDecodeError:
-                    print(f"  !! bad JSON: {line}", file=sys.stderr)
-                    continue
-                try:
-                    ser.write((line + "\n").encode())
-                    ser.flush()
-                    print(f"  -> {line}")
-                except serial.SerialException as e:
-                    print(f"  !! serial error: {e}", file=sys.stderr)
-                    sys.exit(1)
+        now = time.monotonic()
+        for line in data.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"  !! bad JSON: {line}", file=sys.stderr)
+                continue
+            sid = msg.get("session_id") or "_anon"
+            if msg.get("event") == "SessionEnd":
+                sessions.pop(sid, None)
+                continue
+            state = msg.get("state")
+            if not state:
+                continue
+            sessions[sid] = (state, now)
+        prune_sessions(sessions, now)
+        push()
 
 
 if __name__ == "__main__":

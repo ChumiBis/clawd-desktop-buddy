@@ -43,6 +43,7 @@ unsigned long lastEventMs = 0;
 unsigned long doneEnteredMs = 0;
 bool moodDirty = true;
 String serialBuf;
+int workingCount = 0;   // concurrent working+waiting sessions (from daemon "count" field)
 
 // Off-screen framebuffer (double buffering): every frame is composed here, then
 // pushed to the panel in a single drawRGBBitmap blit. The on-glass pixels are
@@ -166,6 +167,11 @@ void handleLine(const String& line) {
     Serial.print("[warn] unknown state: "); Serial.println(s);
     return;
   }
+  int newCount = doc["count"] | 0;
+  if (newCount != workingCount) {
+    workingCount = newCount;
+    moodDirty = true;   // count changed → force a redraw even if mood is unchanged
+  }
   setMood(next);
   lastEventMs = millis();
 }
@@ -186,6 +192,18 @@ void pollSerial() {
 // ── Per-mood renderers ──────────────────────────────────────────
 // Each renderer is called every frame (~33fps). They use a static
 // frame counter for animation. They redraw only when needed.
+
+// Bottom-center session count (text size 3), shown only when ≥2 concurrent
+// working/waiting sessions. Composed into the canvas before present().
+void drawCountBadge(int16_t y) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d", workingCount);
+  int16_t w = (int16_t)strlen(buf) * 6 * 3;   // 6px advance × textsize 3
+  canvas.setTextColor(C_BLACK);
+  canvas.setTextSize(3);
+  canvas.setCursor((DISP_W - w) / 2, y);
+  canvas.print(buf);
+}
 
 void drawIdle() {
   static uint8_t step = 0;
@@ -263,13 +281,18 @@ void drawWorking() {
     int16_t jx = (now / 100) % 3 - 1;  // -1, 0, 1
     canvas.fillRect(lx + jx, ey, EYE_W, EYE_H, C_BLACK);
     canvas.fillRect(rx - jx, ey, EYE_W, EYE_H, C_BLACK);
-    // Bottom: . / .. / ... cycle
-    canvas.setTextColor(C_BLACK);
-    canvas.setTextSize(3);
-    canvas.setCursor(95, 180);
-    if      (dots % 3 == 0) canvas.print(".");
-    else if (dots % 3 == 1) canvas.print("..");
-    else                    canvas.print("...");
+    if (workingCount >= 2) {
+      // Multiple concurrent sessions: show the count instead of the dots
+      drawCountBadge(180);
+    } else {
+      // Bottom: . / .. / ... cycle
+      canvas.setTextColor(C_BLACK);
+      canvas.setTextSize(3);
+      canvas.setCursor(95, 180);
+      if      (dots % 3 == 0) canvas.print(".");
+      else if (dots % 3 == 1) canvas.print("..");
+      else                    canvas.print("...");
+    }
     present();
     dots++;
     lastStep = now;
@@ -290,9 +313,19 @@ void drawWaiting() {
     canvas.fillRect(lx, ey + bounce - 3, EYE_W, eh, C_BLACK);
     canvas.fillRect(rx, ey + bounce - 3, EYE_W, eh, C_BLACK);
     canvas.setTextColor(C_BLACK);
-    canvas.setTextSize(4);
-    canvas.setCursor(105, 185);
-    canvas.print("?");
+    if (workingCount >= 2) {
+      // "?N" — N concurrent sessions, at least one awaiting input
+      char buf[8];
+      snprintf(buf, sizeof(buf), "?%d", workingCount);
+      int16_t w = (int16_t)strlen(buf) * 6 * 3;
+      canvas.setTextSize(3);
+      canvas.setCursor((DISP_W - w) / 2, 185);
+      canvas.print(buf);
+    } else {
+      canvas.setTextSize(4);
+      canvas.setCursor(105, 185);
+      canvas.print("?");
+    }
     present();
     step++;
     lastStep = now;
